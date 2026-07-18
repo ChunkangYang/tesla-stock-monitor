@@ -1,9 +1,11 @@
 # Checks the Tesla shop product page for stock and notifies via Telegram.
+# NOTE: schedule trigger disabled - GitHub Actions runner IPs (datacenter/cloud
+# ranges) are blocked outright by Akamai regardless of headed/headless mode,
+# unlike a residential home IP. Kept as manual-only for reference/debugging.
+# The working monitor runs locally via Windows Task Scheduler instead.
 name: Tesla Stock Monitor
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'
   workflow_dispatch: {}
 
 concurrency:
