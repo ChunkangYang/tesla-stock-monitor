@@ -1,0 +1,48 @@
+name: Bisect3
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: tesla-stock-monitor-3
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Google Chrome and Xvfb
+        run: |
+          curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb
+          sudo apt-get update
+          sudo apt-get install -y /tmp/chrome.deb xvfb
+
+      - name: Run stock check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: xvfb-run -a node monitor.js
+
+      - name: Commit state change if any
+        run: |
+          if ! git diff --quiet -- state.json; then
+            git config user.name "tesla-stock-monitor-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "update stock state"
+            git push
+          fi
