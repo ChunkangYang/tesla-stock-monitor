@@ -1,0 +1,19 @@
+name: Bisect2
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: tesla-stock-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
