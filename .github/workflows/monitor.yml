@@ -1,3 +1,4 @@
+# Checks the Tesla shop product page for stock and notifies via Telegram.
 name: Tesla Stock Monitor
 
 on:
