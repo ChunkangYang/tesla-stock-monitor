@@ -1,9 +1,15 @@
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
+const { ensureMonitorChrome } = require('./chrome-launcher');
 
+const SHOP_TOP_URL = 'https://shop.tesla.com/ja_jp/';
 const PRODUCT_URL = 'https://shop.tesla.com/ja_jp/product/gen-2-mobile-connector-bundle-jp';
-const OUT_OF_STOCK_TEXT = '在庫切れ';
+const INVENTORY_API_URL = 'https://shop.tesla.com/ja_jp/inventory.json';
+const SKU_CODE = '1458882-00-D';
+const CDP_PORT = 9222;
+const CDP_URL = `http://localhost:${CDP_PORT}`;
+const CHROME_PROFILE_DIR = path.join(__dirname, '.chrome-profile');
 const STATE_FILE = path.join(__dirname, 'state.json');
 const LOG_FILE = path.join(__dirname, 'monitor.log');
 // Local Windows fallback only - GitHub Actions provides these via env vars (Secrets).
@@ -54,40 +60,102 @@ async function sendTelegramMessage(text) {
   }
 }
 
-// Akamai blocks headless Chrome outright (returns a 403 "Access Denied" page
-// with no product content). A real, headed Chrome is required to get past
-// its bot detection. The window is pushed off-screen so it doesn't disturb
-// the user even though it's technically visible.
-const PAGE_LOAD_CONFIRMATIONS = ['¥47,500', 'GEN II モバイルコネクター', 'カートに入れる'];
-
-async function checkStock() {
-  const browser = await chromium.launch({
-    headless: false,
-    channel: 'chrome',
-    args: ['--window-position=-2400,-2400', '--window-size=1280,900'],
-  });
+// Pure function run inside the page via page.evaluate. Posts to Tesla's own
+// inventory API from a same-origin tesla.com page context (so the request
+// carries the page's Akamai session cookies) instead of scraping the DOM.
+async function fetchInventoryInPage({ apiUrl, skuCode }) {
   try {
-    const context = await browser.newContext({
-      locale: 'ja-JP',
-      viewport: { width: 1280, height: 900 },
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify([skuCode]),
+      credentials: 'include',
+      cache: 'no-store',
     });
-    const page = await context.newPage();
-    const resp = await page.goto(PRODUCT_URL, { waitUntil: 'load', timeout: 30000 });
-    await page.waitForTimeout(4000);
-
-    const bodyText = await page.textContent('body');
-    const pageLoadedProperly = PAGE_LOAD_CONFIRMATIONS.some((marker) => bodyText.includes(marker));
-
-    if (!pageLoadedProperly) {
-      throw new Error(
-        `Page did not load expected product content (HTTP ${resp.status()}, title="${await page.title()}") - likely blocked by Akamai. Treating as inconclusive, not as in-stock.`
-      );
+    const text = await res.text().catch(() => '');
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
     }
+    return { ok: true, status: res.status, json, textSnippet: text.slice(0, 200) };
+  } catch (e) {
+    return { ok: false, status: 0, json: null, textSnippet: '', error: e?.message ?? String(e) };
+  }
+}
 
-    const outOfStock = bodyText.includes(OUT_OF_STOCK_TEXT);
-    return { inStock: !outOfStock, rawSnippet: outOfStock ? OUT_OF_STOCK_TEXT : '(no out-of-stock badge found)' };
+// entry.purchasable is the authoritative signal; inventoryCount can be 0 even
+// when in stock, so it's only used as a secondary positive signal.
+function judgeInventory(raw, skuCode) {
+  if (!raw || raw.ok !== true || raw.status !== 200 || !Array.isArray(raw.json)) {
+    return { state: 'unknown', reason: raw?.error ?? raw?.textSnippet ?? 'non-200/non-json response' };
+  }
+  const entry = raw.json.find((e) => e && e.skuCode === skuCode) || raw.json[0] || null;
+  if (!entry || typeof entry !== 'object') {
+    return { state: 'unknown', reason: 'no matching entry in response' };
+  }
+  const count = Number(entry.inventoryCount);
+  if (entry.purchasable === true || (Number.isFinite(count) && count > 0)) {
+    return { state: 'in_stock', reason: JSON.stringify(entry) };
+  }
+  if (entry.purchasable === false || entry.error === 'Out of stock') {
+    return { state: 'out_of_stock', reason: JSON.stringify(entry) };
+  }
+  return { state: 'unknown', reason: `ambiguous entry: ${JSON.stringify(entry)}` };
+}
+
+// Attaches to a real, persistent Chrome (via CDP) instead of launching a
+// fresh automated browser each check - Akamai trusts an authentic, already
+// "warmed" browser session far more than a brand-new one. The Chrome process
+// is left running (detached) so later scheduled runs reuse the same session.
+async function checkStock() {
+  await ensureMonitorChrome({ port: CDP_PORT, profileDir: CHROME_PROFILE_DIR });
+  const browser = await chromium.connectOverCDP(CDP_URL);
+  try {
+    const contexts = browser.contexts();
+    const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
+    const page = await context.newPage();
+    try {
+      // Warm up on the lightly-protected shop top page first so Akamai's
+      // sensor JS validates the _abck cookie before we hit the API directly.
+      // 'load' (not 'domcontentloaded') so any client-side redirect the SPA
+      // does on entry has already settled before we touch the page context.
+      await page.goto(SHOP_TOP_URL, { waitUntil: 'load', timeout: 60000 });
+      try {
+        await page.mouse.move(420, 360);
+        await page.waitForTimeout(500);
+        await page.mouse.wheel(0, 400);
+        await page.waitForTimeout(500);
+      } catch {
+        // Best-effort human-like signal; failure here isn't fatal.
+      }
+      // Extra settle time: the SPA can still redirect/reload just after
+      // 'load' fires, which would destroy the JS context mid-evaluate.
+      await page.waitForTimeout(2000);
+
+      let raw;
+      try {
+        raw = await page.evaluate(fetchInventoryInPage, {
+          apiUrl: INVENTORY_API_URL,
+          skuCode: SKU_CODE,
+        });
+      } catch (err) {
+        // One retry if the page context got destroyed by a late redirect.
+        if (!/Execution context was destroyed/.test(err?.message ?? '')) throw err;
+        await page.waitForTimeout(2000);
+        raw = await page.evaluate(fetchInventoryInPage, {
+          apiUrl: INVENTORY_API_URL,
+          skuCode: SKU_CODE,
+        });
+      }
+      const judged = judgeInventory(raw, SKU_CODE);
+      return { inStock: judged.state === 'in_stock', state: judged.state, reason: judged.reason };
+    } finally {
+      await page.close().catch(() => {});
+    }
   } finally {
-    await browser.close();
+    await browser.close(); // Disconnects CDP only - the real Chrome keeps running.
   }
 }
 
@@ -101,9 +169,15 @@ async function main() {
     return;
   }
 
-  log(`Check result: inStock=${result.inStock} (${result.rawSnippet})`);
+  log(`Check result: state=${result.state} (${result.reason})`);
 
-  const newStatus = result.inStock ? 'in_stock' : 'out_of_stock';
+  if (result.state === 'unknown') {
+    // Inconclusive (Access Denied page, network error, unexpected API shape).
+    // Never treat this as in-stock - skip notifying and leave state.json as-is.
+    return;
+  }
+
+  const newStatus = result.state; // 'in_stock' | 'out_of_stock'
 
   if (newStatus === 'in_stock' && state.lastStatus !== 'in_stock') {
     log('Status changed to IN STOCK -> sending Telegram notification');
